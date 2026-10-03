@@ -11,7 +11,7 @@ scoped functions in `strafe_api`. It requires no PostgreSQL password, certificat
 or direct database port. Node verifies HTTPS certificates through its normal trust store.
 Plugin and website Strafe API keys and endpoints stay unchanged.
 
-1. Run `pnpm migrate:prod --sql` in this repository. It generates `migrations-prod.sql`
+1. Use the automatic migration instructions below, or run `pnpm migrate:prod --sql` in this repository. It generates `migrations-prod.sql`
    without connecting to a database or reading administrator credentials. Paste/run the
    complete generated file in Supabase SQL Editor as `postgres`. It applies pending SQL
    under one transaction and the same migration advisory lock; existing checksums, missing
@@ -47,11 +47,53 @@ Supabase's readiness function, while `/healthz` remains a local liveness check.
 References: [custom schemas](https://supabase.com/docs/guides/api/using-custom-schemas)
 and [server API keys](https://supabase.com/docs/guides/getting-started/api-keys).
 
+## Automatically apply migrations over HTTPS
+
+`pnpm migrate:prod` now loads the API `.env` and applies pending migrations through
+Supabase's Management API. It needs no database password or certificate file. It uses
+our existing SQL migration files and `strafe_migrations` checksums, including migrations
+previously applied through the generated SQL Editor bundle. No Prisma schema or second
+migration history is introduced.
+
+Create a Supabase personal access token scoped to this project with Database Write
+permission. This deployment-only `SUPABASE_ACCESS_TOKEN` is different from the runtime
+`SUPABASE_SECRET_KEY`. Keep it out of the runtime `.env` passed to Docker; provide it
+only to the migration command. The project reference is inferred from `SUPABASE_URL`
+in `.env`; set `SUPABASE_PROJECT_REF` only for a custom Supabase domain.
+
+On the VPS in Bash:
+
+```sh
+read -rs -p "Supabase migration access token: " SUPABASE_ACCESS_TOKEN
+printf '\n'
+export SUPABASE_ACCESS_TOKEN
+pnpm migrate:prod
+unset SUPABASE_ACCESS_TOKEN
+```
+
+The migration command applies the bundle in a transaction with an advisory lock and
+then verifies every recorded checksum. No destructive schema diff, reset or automatic
+retry is performed. If the HTTPS request times out, rerun the same command: migration
+history ensures completed migrations are skipped. Do not edit applied migrations.
+The Management API query endpoint is currently documented as beta; the `--sql` export
+remains available if that service is unavailable. See [query API](https://supabase.com/docs/reference/api/v1-run-a-query)
+and [personal access tokens](https://supabase.com/docs/guides/platform/personal-access-tokens).
+
+For Docker, build the existing `migrator` target and run it without a CA mount:
+
+```sh
+docker build --target migrator -t strafemc-api-migrator:latest .
+# Supply SUPABASE_ACCESS_TOKEN temporarily as above.
+docker run --rm --env-file .env -e SUPABASE_ACCESS_TOKEN \
+  strafemc-api-migrator:latest
+unset SUPABASE_ACCESS_TOKEN
+```
+
 ## Direct PostgreSQL deployment (optional)
 
 Requirements: Node.js 22.9 or newer and pnpm 10. The `start:prod` script uses Node's optional environment file loader.
 
-1. Apply pending migrations with `pnpm migrate:prod` as the Supabase database administrator (`postgres`). Provide `MIGRATIONS_DATABASE_URL` for this command through the deployment secret manager or a protected `.env.migrate` file. It is intentionally separate from `DATABASE_URL`, which is the restricted API runtime login. Set `DATABASE_SSL_CA_PATH` to the Supabase database root certificate for verified TLS. The command serializes concurrent runs, tracks applied migrations and checksums in the private `strafe_migrations` schema, and rejects changed or missing applied migration files. Run it in a controlled deployment step and do not put the administrator URL in the API server's permanent environment. The second migration creates the restricted `strafe_points_runtime` permission role and a disabled `strafe_points_api` login.
+1. Apply pending migrations with `pnpm migrate:postgres` as the Supabase database administrator (`postgres`). Provide `MIGRATIONS_DATABASE_URL` for this command through the deployment secret manager or a protected `.env.migrate` file. It is intentionally separate from `DATABASE_URL`, which is the restricted API runtime login. Set `DATABASE_SSL_CA_PATH` to the Supabase database root certificate for verified TLS. The command serializes concurrent runs, tracks applied migrations and checksums in the private `strafe_migrations` schema, and rejects changed or missing applied migration files. Run it in a controlled deployment step and do not put the administrator URL in the API server's permanent environment. The second migration creates the restricted `strafe_points_runtime` permission role and a disabled `strafe_points_api` login.
 2. In the Supabase SQL Editor, run `select public.issue_points_database_password();` as `postgres`. The function enables `strafe_points_api`, sets a randomly generated password, and returns it once. Each call rotates the password, so save the result directly to the API server's secret manager before calling it again. To disable database login during an incident, run `alter role strafe_points_api nologin;`.
 3. Copy `.env.example` to `.env` for local deployment. In the Supabase Dashboard's **Connect** panel, choose Direct Connection for an IPv6-capable persistent host, or Session Pooler for an IPv4-only host. Use `strafe_points_api` as the direct connection username; for the shared session pooler use `strafe_points_api.<project-ref>`. Keep the dashboard's host and port, set the issued password in `DATABASE_URL`, download the Supabase database root certificate, and set its file path in `DATABASE_SSL_CA_PATH`. Leave SSL query parameters out of `DATABASE_URL`; the API verifies the certificate and server name itself. The pooler username format and reachable connection methods depend on the selected Supabase connection mode. [Supabase connection documentation](https://supabase.com/docs/guides/database/connecting-to-postgres) describes the modes and username formats.
 4. Set `point_settings.starting_points` to match the plugin's `competitive.starting-points` setting before the first season begins. The database default is 1000. Set `PORT` if the deployment needs a different port.
@@ -79,14 +121,14 @@ docker run -d \
 
 Set `DATABASE_SSL_CA_PATH=/run/secrets/supabase-prod-root.crt` in `.env`. The example `.env` binds to loopback for a host process, so the Docker command explicitly sets `HOST=0.0.0.0` inside the container. The published port remains on host loopback for a TLS reverse proxy. Do not add `MIGRATIONS_DATABASE_URL` to this runtime environment.
 
-For a one-off database migration container, build the separate target and run it with the protected administrator environment file and CA certificate:
+For an optional direct PostgreSQL migration container, build the separate target and run it with the protected administrator environment file and CA certificate:
 
 ```sh
 docker build --target migrator -t strafemc-api-migrator:latest .
 docker run --rm \
   --env-file .env.migrate \
   --mount type=bind,source=/etc/strafe/supabase-root.crt,target=/run/secrets/supabase-prod-root.crt,readonly \
-  strafemc-api-migrator:latest
+  strafemc-api-migrator:latest node scripts/migrate-prod.mjs --postgres
 ```
 
 Keep `.env.migrate` out of the long-running API container and source control. The migrator target contains the SQL migration files and PostgreSQL client but does not start the HTTP service.

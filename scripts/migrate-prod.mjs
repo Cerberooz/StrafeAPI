@@ -10,6 +10,17 @@ if (process.argv.includes('--sql')) {
   process.exit(0);
 }
 
+if (!process.argv.includes('--postgres')) {
+  try {
+    const { migrateHttps } = await import('./migrate-https.mjs');
+    await migrateHttps();
+  } catch (error) {
+    process.stderr.write(`Production migration failed: ${error instanceof Error ? error.message : 'unknown error'}\n`);
+    process.exitCode = 1;
+  }
+  process.exit(process.exitCode || 0);
+}
+
 const directory = resolve(dirname(fileURLToPath(import.meta.url)), '../supabase/migrations');
 const databaseUrlRaw = process.env.MIGRATIONS_DATABASE_URL?.trim();
 if (!databaseUrlRaw) {

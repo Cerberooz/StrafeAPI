@@ -11,8 +11,21 @@ begin
 end;
 $$;
 
-alter role strafe_points_runtime nologin nosuperuser nocreatedb nocreaterole noinherit noreplication nobypassrls;
-alter role strafe_points_api nosuperuser nocreatedb nocreaterole inherit noreplication nobypassrls;
+-- Supabase postgres is not a superuser. Even ALTER ROLE ... NOSUPERUSER
+-- requires superuser privileges; verify restricted attributes instead.
+do $role_safety$
+begin
+  if exists (
+    select 1 from pg_catalog.pg_roles
+    where rolname in ('strafe_points_runtime', 'strafe_points_api')
+      and (rolsuper or rolreplication or rolbypassrls)
+  ) then
+    raise exception 'Strafe database roles have unsafe privileges; administrator intervention is required';
+  end if;
+end;
+$role_safety$;
+alter role strafe_points_runtime nologin nocreatedb nocreaterole noinherit;
+alter role strafe_points_api nocreatedb nocreaterole inherit;
 alter role strafe_points_api set search_path = pg_catalog;
 grant strafe_points_runtime to strafe_points_api;
 

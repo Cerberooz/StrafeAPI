@@ -3,11 +3,12 @@ import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
-export async function exportMigrations() {
+export async function migrationBundle() {
   const directory = fileURLToPath(new URL('../supabase/migrations/', import.meta.url));
   const files = (await readdir(directory)).filter(name => /^\d{14}_[a-z0-9_]+\.sql$/.test(name)).sort();
   if (!files.length) throw new Error('No migrations found');
   const quote = value => "'" + value.replaceAll("'", "''") + "'";
+  const checksums = {};
   const chunks = [`begin;
 select pg_catalog.pg_advisory_xact_lock(${0x53545246}, ${0x4d494752});
 do $identity$ begin
@@ -29,6 +30,7 @@ end $history$;`];
   for (const name of files) {
     const sql = await readFile(resolve(directory, name), 'utf8');
     const checksum = createHash('sha256').update(sql).digest('hex');
+    checksums[name] = checksum;
     const tag = `$migration_${name.slice(0, 14)}$`;
     if (sql.includes(tag)) throw new Error('Migration delimiter collision');
     chunks.push(`do $apply$ declare previous text; begin
@@ -45,7 +47,12 @@ end $history$;`];
 end $apply$;`);
   }
   chunks.push('commit;');
+  return { query: chunks.join('\n\n'), checksums };
+}
+
+export async function exportMigrations() {
+  const { query } = await migrationBundle();
   const output = resolve('migrations-prod.sql');
-  await writeFile(output, chunks.join('\n\n'), 'utf8');
+  await writeFile(output, query, 'utf8');
   process.stdout.write(`Generated ${output}. Run the complete file as postgres in Supabase SQL Editor.\n`);
 }
