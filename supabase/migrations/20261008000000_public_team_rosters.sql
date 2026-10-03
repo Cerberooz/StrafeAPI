@@ -24,7 +24,7 @@ declare
   v_count integer := 0;
 begin
   if p_profiles is null or pg_catalog.jsonb_typeof(p_profiles) <> 'array'
-      or case when pg_catalog.jsonb_typeof(p_profiles) = 'array' then pg_catalog.jsonb_array_length(p_profiles) > 500 else false end then
+      or (case when pg_catalog.jsonb_typeof(p_profiles) = 'array' then pg_catalog.jsonb_array_length(p_profiles) > 500 else false end) then
     raise exception 'profiles must contain at most 500 rows' using errcode = '22023';
   end if;
   for v_row in select value from pg_catalog.jsonb_array_elements(p_profiles)
