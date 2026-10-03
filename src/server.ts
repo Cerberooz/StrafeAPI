@@ -307,6 +307,9 @@ const portraitLimiter = new RateLimiter(rateWindowMs, Math.min(maxPerIp, 30));
 const pendingPortraits = new Map<string, Promise<Buffer>>();
 const portraitRegistrationCache = new Map<string, { checkedAt: number; registered: boolean }>();
 const pendingPortraitRegistrations = new Map<string, Promise<boolean>>();
+type ResolvedOfficialSkin = { model: 'classic' | 'slim'; textureUrl: string; portraitPath: string };
+const officialSkinCache = new Map<string, { value: ResolvedOfficialSkin | null; expiresAt: number; pending?: Promise<ResolvedOfficialSkin | null> }>();
+const officialPortraitApprovals = new Map<string, number>();
 let activePortraitFetches = 0;
 let portraitCacheWrites = 0;
 let lastPortraitPruneAt = 0;
@@ -553,7 +556,7 @@ function parseText(value: unknown, label: string, maxLength: number, allowEmpty 
   return text;
 }
 
-function optionalProfileFields(body: JsonRecord, subjectType?: SubjectType): JsonRecord {
+function optionalProfileFields(body: JsonRecord, subjectType?: SubjectType, allowRoster = false): JsonRecord {
   const result: JsonRecord = {};
   if (Object.hasOwn(body, 'displayName')) {
     result.displayName = body.displayName === null ? null : parseText(body.displayName, 'displayName', 255);
@@ -566,6 +569,39 @@ function optionalProfileFields(body: JsonRecord, subjectType?: SubjectType): Jso
       throw new HttpError(400, 'invalid_request', 'memberCount is only supported for team subjects.');
     }
     result.memberCount = body.memberCount === null ? null : parseInteger(body.memberCount, 'memberCount', 0, 1_000);
+  }
+  if (Object.hasOwn(body, 'members')) {
+    if (!allowRoster) throw new HttpError(400, 'invalid_request', 'Publish team rosters through the profiles endpoint.');
+    if (subjectType !== 'team' || !Array.isArray(body.members) || body.members.length > 1_000) {
+      throw new HttpError(400, 'invalid_request', 'members is only supported as a team roster with at most 1000 entries.');
+    }
+    const seen = new Set<string>();
+    result.members = body.members.map((raw, index) => {
+      const member = requireObject(raw, `members[${index}]`);
+      const playerId = parseUuid(member.playerId, `members[${index}].playerId`);
+      const playerName = parseText(member.playerName, `members[${index}].playerName`, 16);
+      const role = parseText(member.role, `members[${index}].role`, 10);
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(playerName) || !['OWNER', 'MANAGER', 'MEMBER'].includes(role)) {
+        throw new HttpError(400, 'invalid_request', `members[${index}] has an invalid player name or role.`);
+      }
+      if (seen.has(playerId)) throw new HttpError(400, 'invalid_request', 'Team rosters cannot contain duplicate player IDs.');
+      seen.add(playerId);
+      return { playerId, playerName, role };
+    });
+    const hasSeason = Object.hasOwn(body, 'rosterSeason');
+    const hasTime = Object.hasOwn(body, 'rosterPublishedAt');
+    if (!hasSeason && !hasTime) {
+      // Older queued automatic profiles may contain members. Keep their ordinary
+      // metadata compatible, but never publish those live rosters into a season.
+      delete result.members;
+    } else {
+      const season = parseText(body.rosterSeason, 'rosterSeason', 64);
+      if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(season)) throw new HttpError(400, 'invalid_request', 'Invalid rosterSeason.');
+      result.rosterSeason = season;
+      result.rosterPublishedAt = parseInteger(body.rosterPublishedAt, 'rosterPublishedAt', 1, Number.MAX_SAFE_INTEGER);
+    }
+  } else if (Object.hasOwn(body, 'rosterSeason') || Object.hasOwn(body, 'rosterPublishedAt')) {
+    throw new HttpError(400, 'invalid_request', 'Roster publication fields require members.');
   }
   return result;
 }
@@ -903,6 +939,59 @@ async function readLimitedBody(response: Response, maxBytes: number): Promise<Bu
   return Buffer.concat(chunks, size);
 }
 
+async function resolveOfficialSkin(playerId: string): Promise<ResolvedOfficialSkin | null> {
+  const now = Date.now();
+  const prior = officialSkinCache.get(playerId);
+  if (prior && prior.expiresAt > now) return prior.pending ?? prior.value;
+  const pending = (async (): Promise<ResolvedOfficialSkin | null> => {
+    const compactId = playerId.replaceAll('-', '').toLowerCase();
+    const response = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${compactId}?unsigned=false`, {
+      redirect: 'error', signal: AbortSignal.timeout(7_000), headers: { Accept: 'application/json' },
+    });
+    if (response.status === 204 || response.status === 404) return null;
+    if (!response.ok || response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() !== 'application/json') return null;
+    const bytes = await readLimitedBody(response, 32 * 1024);
+    const profile: unknown = JSON.parse(bytes.toString('utf8'));
+    if (profile === null || typeof profile !== 'object' || Array.isArray(profile)) return null;
+    const record = profile as JsonRecord;
+    if (typeof record.id !== 'string' || record.id.toLowerCase() !== compactId || !Array.isArray(record.properties)) return null;
+    const texturesProperty = record.properties.find((property: unknown) => property && typeof property === 'object'
+      && !Array.isArray(property) && (property as JsonRecord).name === 'textures') as JsonRecord | undefined;
+    const encoded = texturesProperty?.value;
+    if (typeof encoded !== 'string' || encoded.length > 8_192 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return null;
+    const textureData: unknown = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+    if (textureData === null || typeof textureData !== 'object' || Array.isArray(textureData)) return null;
+    const textures = (textureData as JsonRecord).textures;
+    if (textures === null || typeof textures !== 'object' || Array.isArray(textures)) return null;
+    const rawSkin = (textures as JsonRecord).SKIN;
+    if (rawSkin === null || typeof rawSkin !== 'object' || Array.isArray(rawSkin)) return null;
+    const skin = rawSkin as JsonRecord;
+    if (typeof skin.url !== 'string') return null;
+    let texture: URL;
+    try { texture = new URL(skin.url); } catch { return null; }
+    const hash = /^\/texture\/([a-f0-9]{40,64})$/i.exec(texture.pathname)?.[1]?.toLowerCase();
+    if (texture.origin !== 'https://textures.minecraft.net' || texture.username || texture.password || texture.search || texture.hash || !hash) return null;
+    const metadata = skin.metadata;
+    const model = metadata && typeof metadata === 'object' && !Array.isArray(metadata) && (metadata as JsonRecord).model === 'slim' ? 'slim' : 'classic';
+    const resolved = { model, textureUrl: `https://textures.minecraft.net/texture/${hash}`, portraitPath: `/v1/accounts/portraits/${hash}/${model}.png` } satisfies ResolvedOfficialSkin;
+    const approvalKey = `${hash}-${model}`;
+    officialPortraitApprovals.delete(approvalKey);
+    officialPortraitApprovals.set(approvalKey, Date.now() + 10 * 60_000);
+    while (officialPortraitApprovals.size > 4_000) officialPortraitApprovals.delete(officialPortraitApprovals.keys().next().value as string);
+    return resolved;
+  })();
+  officialSkinCache.set(playerId, { value: null, expiresAt: now + 5 * 60_000, pending });
+  try {
+    const value = await pending;
+    officialSkinCache.set(playerId, { value, expiresAt: Date.now() + (value ? 5 : 0.5) * 60_000 });
+    while (officialSkinCache.size > 4_000) officialSkinCache.delete(officialSkinCache.keys().next().value as string);
+    return value;
+  } catch {
+    officialSkinCache.set(playerId, { value: null, expiresAt: Date.now() + 30_000 });
+    return null;
+  }
+}
+
 async function skinPiece(
   source: Buffer,
   crop: { left: number; top: number; width: number; height: number },
@@ -1041,6 +1130,9 @@ async function getPortrait(textureHash: string, model: 'classic' | 'slim'): Prom
 async function hasRegisteredPortrait(textureHash: string, model: 'classic' | 'slim'): Promise<boolean> {
   const key = `${textureHash}-${model}`;
   const now = Date.now();
+  const approvedUntil = officialPortraitApprovals.get(key);
+  if (approvedUntil && approvedUntil > now) return true;
+  if (approvedUntil) officialPortraitApprovals.delete(key);
   const cached = portraitRegistrationCache.get(key);
   const ttlMs = cached?.registered ? 30_000 : 3_000;
   if (cached && now - cached.checkedAt < ttlMs) {
@@ -1189,20 +1281,35 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     if (idValues.length < 1 || idValues.length > 100) throw new HttpError(400, 'invalid_query', 'ids must contain between 1 and 100 UUIDs.');
     const playerIds = idValues.map((value, index) => parseUuid(value, `ids[${index}]`));
     if (new Set(playerIds).size !== playerIds.length) throw new HttpError(400, 'invalid_query', 'ids cannot contain duplicate UUIDs.');
+    const resolvePremium = url.searchParams.get('resolvePremium');
+    if (resolvePremium !== null && resolvePremium !== 'true' && resolvePremium !== 'false') {
+      throw new HttpError(400, 'invalid_query', 'resolvePremium must be true or false.');
+    }
     const result = await rpc<JsonRecord>('get_account_skins', { p_key_hash: apiKey.key_hash, p_player_ids: playerIds });
     const rawSkins = result.skins;
     if (rawSkins === null || typeof rawSkins !== 'object' || Array.isArray(rawSkins)) throw new BackendError();
     const skins: JsonRecord = {};
-    for (const [playerId, rawSkin] of Object.entries(rawSkins as JsonRecord)) {
-      if (rawSkin === null || typeof rawSkin !== 'object' || Array.isArray(rawSkin)) continue;
-      const skin = rawSkin as JsonRecord;
-      if (typeof skin.textureUrl !== 'string' || typeof skin.portraitPath !== 'string'
-        || (skin.model !== 'classic' && skin.model !== 'slim')) continue;
-      skins[playerId.toLowerCase()] = {
-        model: skin.model,
-        textureUrl: skin.textureUrl,
-        portraitUrl: publicAccountUrl(skin.portraitPath),
-      };
+    const accountSkins = Object.entries(rawSkins as JsonRecord);
+    for (let offset = 0; offset < accountSkins.length; offset += 8) {
+      await Promise.all(accountSkins.slice(offset, offset + 8).map(async ([playerId, rawSkin]) => {
+        if (rawSkin === null || typeof rawSkin !== 'object' || Array.isArray(rawSkin)) return;
+        const skin = rawSkin as JsonRecord;
+        const premium = skin.premium === true;
+        let appearance: ResolvedOfficialSkin | null = null;
+        if (premium && resolvePremium !== 'false') {
+          try { appearance = await resolveOfficialSkin(playerId); } catch { appearance = null; }
+        } else if (!premium && typeof skin.textureUrl === 'string' && typeof skin.portraitPath === 'string'
+          && (skin.model === 'classic' || skin.model === 'slim')) {
+          appearance = { model: skin.model, textureUrl: skin.textureUrl, portraitPath: skin.portraitPath };
+        }
+        const value: JsonRecord = { premium, linked: skin.linked === true };
+        if (appearance) {
+          value.model = appearance.model;
+          value.textureUrl = appearance.textureUrl;
+          value.portraitUrl = publicAccountUrl(appearance.portraitPath);
+        }
+        skins[playerId.toLowerCase()] = value;
+      }));
     }
     sendJson(response, 200, { skins });
     return;
@@ -1623,7 +1730,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
         throw new HttpError(400, 'invalid_request', `profiles[${index}].displayName is required.`);
       }
       const displayName = row.displayName === null ? null : parseText(row.displayName, `profiles[${index}].displayName`, 255);
-      const profile = optionalProfileFields(row, subjectType);
+      const profile = optionalProfileFields(row, subjectType, true);
       return { subjectType, subjectId, displayName, ...profile };
     });
     const result = await rpc<JsonRecord>('sync_point_profiles', {
