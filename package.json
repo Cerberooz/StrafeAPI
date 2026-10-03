@@ -1,0 +1,28 @@
+{
+  "name": "strafesmp-api-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.18.3",
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "scripts": {
+    "build:prod": "tsc -p tsconfig.prod.json",
+    "start:prod": "node --env-file-if-exists=.env dist/server.js",
+    "migrate:prod": "node --env-file-if-exists=.env.migrate scripts/migrate-prod.mjs",
+    "account:recover": "node scripts/recover-account-link.mjs",
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "api-key:generate": "node scripts/generate-api-key.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.1",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
