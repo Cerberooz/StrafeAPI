@@ -15,7 +15,7 @@ RUN pnpm install --prod --frozen-lockfile
 
 FROM production-dependencies AS migrator
 ENV NODE_ENV=production
-COPY scripts/migrate-prod.mjs ./scripts/migrate-prod.mjs
+COPY scripts/migrate-prod.mjs scripts/export-migrations.mjs ./scripts/
 COPY supabase/migrations ./supabase/migrations
 USER node
 CMD ["node", "scripts/migrate-prod.mjs"]

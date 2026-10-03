@@ -7,3 +7,5 @@ password.txt
 *.log
 npm-debug.log*
 pnpm-debug.log*
+
+migrations-prod.sql

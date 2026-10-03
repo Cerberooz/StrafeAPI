@@ -6,6 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import sharp from 'sharp';
+import { SupabaseRpc } from './supabase-rpc.js';
 
 const MAX_POINTS = 2_147_483_647;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -158,6 +159,10 @@ if (accountPublicUrlRaw) {
 }
 const accountOAuthEnabled = Boolean(discordClientId && discordClientSecret && accountPublicOrigin);
 
+const supabase = process.env.SUPABASE_URL?.trim()
+  ? new SupabaseRpc(requiredEnv('SUPABASE_URL'), requiredEnv('SUPABASE_SECRET_KEY')) : null;
+let databasePool: Pool | null = null;
+if (!supabase) {
 const databaseUrlRaw = requiredEnv('DATABASE_URL');
 let databaseUrl: URL;
 try {
@@ -187,7 +192,7 @@ if (!isLocalDatabase) {
   }
 }
 
-const databasePool = new Pool({
+databasePool = new Pool({
   connectionString: databaseUrlRaw,
   ...(databaseTls ? { ssl: databaseTls } : {}),
   max: databasePoolMax,
@@ -197,6 +202,8 @@ const databasePool = new Pool({
   application_name: 'strafe-points-api',
 });
 databasePool.on('error', () => process.stderr.write('Idle database connection failed.\n'));
+
+}
 
 const RPC_CALLS = {
   get_point_balance: {
@@ -340,7 +347,12 @@ function mapDatabaseError(error: unknown): never {
 async function rpc<T>(name: keyof typeof RPC_CALLS, parameters: JsonRecord): Promise<T> {
   const specification = RPC_CALLS[name];
   try {
-    const result = await databasePool.query<{ value: T }>(
+    if (supabase) {
+      const functionName = /strafe_api\.([a-z_]+)\(/.exec(specification.sql)?.[1];
+      if (!functionName) throw new BackendError();
+      return await supabase.call<T>(functionName, Object.fromEntries(specification.args.map(key => [key, parameters[key]])));
+    }
+    const result = await databasePool!.query<{ value: T }>(
       specification.sql,
       specification.args.map((key) => parameters[key]),
     );
@@ -354,7 +366,12 @@ async function rpc<T>(name: keyof typeof RPC_CALLS, parameters: JsonRecord): Pro
 async function findApiKey(token: string): Promise<ApiKey | null> {
   const hash = createHash('sha256').update(token, 'utf8').digest('hex');
   try {
-    const result = await databasePool.query<Omit<ApiKey, 'key_hash'>>(
+    if (supabase) {
+      const rows = await supabase.call<Omit<ApiKey, 'key_hash'>[]>('authenticate_point_api_key', { p_key_hash: hash });
+      const row = rows[0];
+      return row ? { ...row, key_hash: hash } : null;
+    }
+    const result = await databasePool!.query<Omit<ApiKey, 'key_hash'>>(
       'select id, label, scopes, expires_at from strafe_api.authenticate_point_api_key($1::text)',
       [hash],
     );
@@ -367,7 +384,11 @@ async function findApiKey(token: string): Promise<ApiKey | null> {
 
 async function checkDatabaseReady(): Promise<void> {
   try {
-    const result = await databasePool.query<{ ready: boolean }>('select strafe_api.points_api_ready() as ready');
+    if (supabase) {
+      if (await supabase.call<boolean>('points_api_ready', {}) !== true) throw new BackendError();
+      return;
+    }
+    const result = await databasePool!.query<{ ready: boolean }>('select strafe_api.points_api_ready() as ready');
     if (result.rows[0]?.ready !== true) throw new BackendError();
   } catch (error) {
     mapDatabaseError(error);
@@ -1991,7 +2012,7 @@ function shutdown(signal: string): void {
   forceClose.unref();
   server.close((error) => {
     clearTimeout(forceClose);
-    void databasePool.end().catch(() => {
+    void databasePool?.end().catch(() => {
       process.stderr.write('Database pool shutdown failed.\n');
       process.exitCode = 1;
     });

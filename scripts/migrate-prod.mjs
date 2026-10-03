@@ -4,6 +4,12 @@ import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from 'pg';
 
+if (process.argv.includes('--sql')) {
+  const { exportMigrations } = await import('./export-migrations.mjs');
+  await exportMigrations();
+  process.exit(0);
+}
+
 const directory = resolve(dirname(fileURLToPath(import.meta.url)), '../supabase/migrations');
 const databaseUrlRaw = process.env.MIGRATIONS_DATABASE_URL?.trim();
 if (!databaseUrlRaw) {

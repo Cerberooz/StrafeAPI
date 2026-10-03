@@ -4,7 +4,50 @@ This service owns the live StrafeSMPCore point balances in Supabase. It runs ind
 
 The API keeps live balances in `point_balances`, display metadata in `point_profiles`, and match records in `point_matches`. The Minecraft plugin sends point changes and match settlements live through this API when configured. A team uses its team UUID as the subject ID; a player uses the Minecraft UUID. Point values and win/loss totals are integers from 0 through 2,147,483,647.
 
-## Run in production
+## HTTPS deployment on a VPS (recommended)
+
+The running API calls Supabase's HTTPS Data API through the existing transactional,
+scoped functions in `strafe_api`. It requires no PostgreSQL password, certificate file,
+or direct database port. Node verifies HTTPS certificates through its normal trust store.
+Plugin and website Strafe API keys and endpoints stay unchanged.
+
+1. Run `pnpm migrate:prod --sql` in this repository. It generates `migrations-prod.sql`
+   without connecting to a database or reading administrator credentials. Paste/run the
+   complete generated file in Supabase SQL Editor as `postgres`. It applies pending SQL
+   under one transaction and the same migration advisory lock; existing checksums, missing
+   files and out-of-order migrations are checked. Retain applied migration files unchanged.
+   This command generates SQL only; it does not apply migrations until you run the file.
+2. In Supabase Data API settings, append `strafe_api` to **Exposed schemas**, preserving
+   existing schemas. The new migration grants `service_role` only the API entry points;
+   it adds no anonymous/authenticated access or table permissions. Leave helper functions
+   and private tables unexposed to those roles. Ensure the Data API is enabled.
+3. Create a server secret in Supabase Settings → API Keys. Put `SUPABASE_URL` and
+   `SUPABASE_SECRET_KEY=sb_secret_...` in the API `.env`. Keep this elevated secret only
+   in the API server; it must never reach Minecraft, Velocity, the website or browsers.
+   Supabase secret keys use `service_role` and can access other project resources granted
+   to that role; use a dedicated Supabase project for Strafe where practical.
+4. Keep the existing Discord, ports, limiter and proxy settings. `HOST=0.0.0.0` inside
+   Docker; publish `127.0.0.1:5000:5000`. In HTTPS mode omit `DATABASE_URL`,
+   `DATABASE_SSL_CA_PATH` and `DATABASE_POOL_MAX` from the runtime `.env`.
+5. Build `docker build -t strafemc-api:latest .` and run:
+
+```sh
+docker run -d --name strafemc-api --restart unless-stopped \
+  --env-file .env -e HOST=0.0.0.0 \
+  --publish 127.0.0.1:5000:5000 \
+  --mount type=volume,source=strafe-account-portraits,target=/data/account-portraits \
+  strafemc-api:latest
+```
+
+HTTPS RPC calls have a 10-second timeout and bounded response size, use fixed function
+names, reject redirects, and do not automatically retry writes. Database idempotency and
+plugin outbox retries remain responsible for safely repeating mutations. `/readyz` calls
+Supabase's readiness function, while `/healthz` remains a local liveness check.
+
+References: [custom schemas](https://supabase.com/docs/guides/api/using-custom-schemas)
+and [server API keys](https://supabase.com/docs/guides/getting-started/api-keys).
+
+## Direct PostgreSQL deployment (optional)
 
 Requirements: Node.js 22.9 or newer and pnpm 10. The `start:prod` script uses Node's optional environment file loader.
 
@@ -271,7 +314,7 @@ select public.archive_point_matches_before(now() - interval '180 days', 10000);
 ## Security notes
 
 - The API does not use a Supabase service-role key. Its database connection uses a dedicated `strafe_points_api` login that inherits only the `strafe_points_runtime` role. That role has schema usage and execute rights on scoped API wrapper functions, with no direct access to point tables or inner mutation functions.
-- Supabase Studio's administrative `service_role` can manage `api_keys`, `point_settings`, and season display labels; it has no grants on live/seasonal balance, profile, mutation, match, or tombstone tables and no `strafe_api` RPC grants after the hardening migration. Keep service-role credentials out of this API process.
+- Supabase Studio's administrative `service_role` can manage `api_keys`, `point_settings`, and season display labels; it has no grants on live/seasonal balance, profile, mutation, match, or tombstone tables. The HTTPS migration grants only the explicit `strafe_api` runtime entry points. Keep service-role credentials out of this API process.
 - API keys are looked up by SHA-256 hash and are never stored in plaintext. Required scopes are checked both in the HTTP server and in the database wrapper functions, including on each read/write RPC; key revocation and scope changes apply to the next request.
 - Database connections to remote Supabase projects verify TLS using the root certificate at `DATABASE_SSL_CA_PATH`. Do not place the runtime database password or API keys in browser code or source control.
 - The mutation RPC records the event UUID, request hash, API key row ID, response, and match summary in the same transaction as point changes. It rejects a reused UUID with a different request.
