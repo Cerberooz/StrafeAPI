@@ -268,6 +268,7 @@ The leaderboard response identifies the selected and active season and has one c
       "displayName": "Example",
       "prefix": "EX",
       "memberCount": 3,
+      "region": "AS",
       "points": 1000,
       "rank": 1,
       "wins": 0,
@@ -287,7 +288,7 @@ The GET snapshot route accepts up to 500 rows per page and returns `{ "subjectTy
 
 `POST /v1/points/snapshot` accepts `{ "balances": [{ "subjectType", "subjectId", "points", "wins", "losses", "displayName", "prefix", "memberCount" }] }`, up to 500 rows. It inserts a balance only when that UUID has no API balance yet. It may update the supplied profile fields, and returns `{ "insertedCount", "existingCount", "deletedCount", "items" }` with current non-deleted API rows. Replaying an old snapshot never restores old points over a newer API balance or a tombstoned team.
 
-`POST /v1/points/profiles` accepts `{ "profiles": [{ "subjectType", "subjectId", "displayName", "prefix", "memberCount" }] }`, up to 500 rows. It upserts metadata without changing points. Names can be `null` or up to 255 characters; team prefixes can be `null` or empty; `memberCount` is a nullable integer from 0 to 1000 and is only valid for teams.
+`POST /v1/points/profiles` accepts `{ "profiles": [{ "subjectType", "subjectId", "displayName", "prefix", "memberCount", "region" }] }`, up to 500 rows. It upserts metadata without changing points. Names can be `null` or up to 255 characters; team prefixes can be `null` or empty; `memberCount` is a nullable integer from 0 to 1000 and is only valid for teams. Region is nullable and accepts `AS`, `EU`, `NA`, `SA`, `OC`, or `AF`; the StrafeSMPCore deployment sets this in its config and sends it for players and teams.
 
 ### Individual and bulk mutations
 

@@ -579,6 +579,16 @@ function parseText(value: unknown, label: string, maxLength: number, allowEmpty 
 
 function optionalProfileFields(body: JsonRecord, subjectType?: SubjectType, allowRoster = false): JsonRecord {
   const result: JsonRecord = {};
+  if (Object.hasOwn(body, 'region')) {
+    if (body.region === null) result.region = null;
+    else {
+      const region = parseText(body.region, 'region', 2).toUpperCase();
+      if (!['AS', 'EU', 'NA', 'SA', 'OC', 'AF'].includes(region)) {
+        throw new HttpError(400, 'invalid_request', 'region must be AS, EU, NA, SA, OC, AF, or null.');
+      }
+      result.region = region;
+    }
+  }
   if (Object.hasOwn(body, 'displayName')) {
     result.displayName = body.displayName === null ? null : parseText(body.displayName, 'displayName', 255);
   }
