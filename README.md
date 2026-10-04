@@ -365,3 +365,9 @@ select public.archive_point_matches_before(now() - interval '180 days', 10000);
 - `leaderboards:read` exposes leaderboard IDs, names, team prefixes/member counts, points, ranks, and W/L totals. `points:read` additionally exposes individual UUID balances and a full paginated balance snapshot. Keep the website key server-side with only `leaderboards:read`.
 - Older plugin versions could create `strafesmp_*_archive` tables outside this API migration. The current plugin no longer writes those snapshots, and this API does not read those tables. If an earlier version created them, review their grants and policies and drop them if they are no longer needed; they may contain member UUIDs and roster data.
 - The key provisioning function is executable only by the Supabase `postgres` role, which is used by the authenticated SQL Editor administrator. It returns plaintext only at issuance; changing or revoking a key never reveals it.
+
+## Proxy-managed skin selection
+
+Apply `20261014000000_proxy_skin_selection.sql` before deploying the new StrafeVelocity plugin. The prepare/commit RPCs accept authenticated cracked identities and reject premium identities with `premium_skin_managed_by_minecraft`. Skin writes retain the existing atomic rolling 24-hour cooldown and request UUID idempotency. Linking is required for cracked competitive participation, not for skin selection.
+
+Velocity resolves and saves skins through its local SkinsRestorer API, then sends signed canonical textures through the existing prepare/commit endpoints. Native SkinsRestorer changes are independent; Velocity checks its current saved selection after the API cooldown expires, and updates the website/NPC mirror only when the appearance differs. Premium leaderboard skins remain sourced from Minecraft. No new endpoint, permission scope, or shared SkinsRestorer database is needed.

@@ -1,4 +1,15 @@
 // Server-only RPC transport. Database wrappers retain scope checks and transactions.
+export class SupabaseRpcError extends Error {
+  constructor(
+    readonly responseStatus: number,
+    readonly backendCode: string | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'SupabaseRpcError';
+  }
+}
+
 export class SupabaseRpc {
   private readonly origin: string;
   constructor(url: string, private readonly secret: string) {
@@ -32,7 +43,13 @@ export class SupabaseRpc {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (!response.ok) {
       // Only PostgreSQL application exceptions participate in the API's error mapping.
-      throw new Error(body?.code === 'P0001' && typeof body.message === 'string' ? body.message : 'Supabase RPC unavailable');
+      const rawCode = body !== null && typeof body === 'object' ? body.code : undefined;
+      const backendCode = typeof rawCode === 'string' && /^[A-Z0-9_]{1,24}$/.test(rawCode) ? rawCode : undefined;
+      throw new SupabaseRpcError(
+        response.status,
+        backendCode,
+        backendCode === 'P0001' && typeof body.message === 'string' ? body.message : 'Supabase RPC unavailable',
+      );
     }
     return body as T;
   }

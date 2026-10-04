@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import sharp from 'sharp';
-import { SupabaseRpc } from './supabase-rpc.js';
+import { SupabaseRpc, SupabaseRpcError } from './supabase-rpc.js';
 
 const MAX_POINTS = 2_147_483_647;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -359,6 +359,18 @@ async function rpc<T>(name: keyof typeof RPC_CALLS, parameters: JsonRecord): Pro
     if (!result.rows[0]) throw new BackendError();
     return result.rows[0].value;
   } catch (error) {
+    const rawCode = error instanceof SupabaseRpcError
+      ? error.backendCode
+      : error !== null && typeof error === 'object' && 'code' in error ? error.code : undefined;
+    const backendCode = typeof rawCode === 'string' && /^[A-Z0-9_]{1,24}$/.test(rawCode) ? rawCode : undefined;
+    const responseStatus = error instanceof SupabaseRpcError ? error.responseStatus : undefined;
+    process.stderr.write(`${JSON.stringify({
+      event: 'rpc_failure',
+      rpc: name,
+      errorType: error instanceof Error ? error.name : 'unknown',
+      ...(responseStatus === undefined ? {} : { backendStatus: responseStatus }),
+      ...(backendCode === undefined ? {} : { backendCode }),
+    })}\n`);
     mapDatabaseError(error);
   }
 }
@@ -430,6 +442,7 @@ function accountError(code: string, details: JsonRecord = {}): HttpError {
     session_owned_by_other_key: 'The active Minecraft session belongs to another API key.',
     account_not_found: 'The Minecraft account was not found.',
     account_link_required: 'A non-premium Minecraft account must be linked to Discord before changing its skin.',
+    premium_skin_managed_by_minecraft: 'Premium players must change their skin through Minecraft Accounts',
     already_linked: 'This Minecraft account is already linked.',
     not_linked: 'This Minecraft account does not have a Discord link to change.',
     link_request_not_found: 'The account link request was not found.',
@@ -455,7 +468,7 @@ function accountError(code: string, details: JsonRecord = {}): HttpError {
   const rateLimited = retryAfterSeconds !== undefined;
   const status = rateLimited ? 429
     : ['session_unavailable', 'stale_session', 'session_conflict'].includes(code) ? 409
-      : code === 'account_link_required' ? 403
+      : code === 'account_link_required' || code === 'premium_skin_managed_by_minecraft' ? 403
         : code === 'link_request_not_found' ? 404
         : ['account_oauth_disabled', 'discord_oauth_failed'].includes(code) ? 503
             : code === 'session_owned_by_other_key' ? 403 : 409;
