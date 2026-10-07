@@ -456,6 +456,7 @@ function accountError(code: string, details: JsonRecord = {}): HttpError {
     discord_already_linked: 'That Discord account is linked to another Minecraft account.',
     idempotency_conflict: 'This request ID was already used with different content.',
     skin_request_throttled: 'Wait briefly before requesting another skin change.',
+    skin_command_rate_limited: 'You can use /account skin up to 3 times per minute. Try again shortly.',
     skin_cooldown: 'This account is still within its skin change cooldown.',
     skin_request_in_progress: 'A skin change is already being resolved for this account.',
     skin_reservation_expired: 'The skin reservation expired. Start a new request.',
