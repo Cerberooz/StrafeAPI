@@ -1,5 +1,11 @@
 # Strafe points API
 
+## Discord tier profiles
+
+`GET /v1/tiers/profile?name=<Minecraft username>` requires a key with `leaderboards:read` and migration `20261020000000_discord_tier_profiles.sql`. It returns public account flags, canonical appearance identifiers, region, the active season ID, and the player's associated Team/Solo standings across seasons. The Discord app in `DiscordBots/StrafeTiers` chooses its highest tier independently for Team and Solo.
+
+Team associations use published season rosters. Current deleted teams and tier-banned players are excluded under the existing visibility rules. This endpoint exposes no Discord identifiers, account sessions or signed texture credentials. A missing/hidden player returns 404; a case-insensitive name collision returns 409. It is rate limited like other leaderboard reads. Apply the new migration and rebuild/restart the API before deploying the bot.
+
 This service owns the live StrafeSMPCore point balances in Supabase. It runs independently from the Minecraft plugin and the web application. The HTTP listener uses port `5000` by default and reads `PORT` at startup.
 
 The API keeps live balances in `point_balances`, display metadata in `point_profiles`, and match records in `point_matches`. The Minecraft plugin sends point changes and match settlements live through this API when configured. A team uses its team UUID as the subject ID; a player uses the Minecraft UUID. Point values and win/loss totals are integers from 0 through 2,147,483,647.

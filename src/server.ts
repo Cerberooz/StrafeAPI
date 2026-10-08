@@ -206,6 +206,10 @@ databasePool.on('error', () => process.stderr.write('Idle database connection fa
 }
 
 const RPC_CALLS = {
+  get_tier_profile: {
+    sql: 'select strafe_api.api_get_tier_profile($1::text, $2::text) as value',
+    args: ['p_key_hash', 'p_name'],
+  },
   get_point_balance: {
     sql: 'select strafe_api.api_get_point_balance($1::text, $2::text, $3::uuid) as value',
     args: ['p_key_hash', 'p_subject_type', 'p_subject_id'],
@@ -1649,6 +1653,23 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
 
+  if (method === 'GET' && pathname === '/v1/tiers/profile') {
+    const apiKey = await requireLeaderboardKey(request);
+    if (!enforceRateLimit(response, accountKeyBucket(apiKey), keyLimiter, requestId)) return;
+    const names = url.searchParams.getAll('name');
+    if (names.length !== 1 || [...url.searchParams.keys()].some(key => key !== 'name')) {
+      throw new HttpError(400, 'invalid_query', 'Provide one name query parameter.');
+    }
+    const name = parseText(names[0], 'name', 16);
+    if (!/^[A-Za-z0-9_]{1,16}$/.test(name)) throw new HttpError(400, 'invalid_query', 'name must be a Minecraft username.');
+    const result = await rpc<JsonRecord>('get_tier_profile', { p_key_hash: apiKey.key_hash, p_name: name });
+    if (result.code === 'player_not_found') throw new HttpError(404, 'player_not_found', 'No public tier profile was found for that player.');
+    if (result.code === 'ambiguous_player_name') throw new HttpError(409, 'ambiguous_player_name', 'More than one account uses that name. Contact a server administrator.');
+    if (!Array.isArray(result.standings) || typeof result.playerId !== 'string' || !UUID_PATTERN.test(result.playerId)) throw new BackendError();
+    sendJson(response, 200, result);
+    return;
+  }
+
   if (method === 'GET' && pathname === '/v1/leaderboards/seasons') {
     const apiKey = await requireLeaderboardKey(request);
     if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
@@ -1959,6 +1980,7 @@ function routeForLog(request: IncomingMessage): string {
     return '/v1/accounts/link/:requestId/confirm';
   }
   if (method === 'GET' && /^\/v1\/accounts\/[^/]+$/.test(pathname)) return '/v1/accounts/:playerId';
+  if (method === 'GET' && pathname === '/v1/tiers/profile') return pathname;
   if (FIXED_LOG_ROUTES.has(`${method} ${pathname}`)) return pathname;
   if (method === 'GET' && pathname === '/v1/leaderboards/seasons') return pathname;
   if (method === 'GET' && /^\/v1\/leaderboards\/(smp-teams|smp-solo|pvp)$/.test(pathname)) {
