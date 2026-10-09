@@ -17,6 +17,7 @@ const SNAPSHOT_BATCH_MAX = 500;
 const FIXED_LOG_ROUTES = new Set([
   'GET /v1/points/snapshot',
   'POST /v1/points/snapshot',
+  'POST /v1/points/snapshot/finalize',
   'POST /v1/points/profiles',
   'POST /v1/points/delete',
   'POST /v1/matches/settle',
@@ -235,8 +236,12 @@ const RPC_CALLS = {
     args: ['p_key_hash', 'p_event_id', 'p_request_hash', 'p_operation', 'p_payload'],
   },
   seed_point_snapshot: {
-    sql: 'select strafe_api.api_seed_point_snapshot($1::text, $2::jsonb) as value',
-    args: ['p_key_hash', 'p_balances'],
+    sql: 'select strafe_api.api_seed_point_snapshot($1::text, $2::jsonb, $3::boolean) as value',
+    args: ['p_key_hash', 'p_balances', 'p_create_missing'],
+  },
+  finalize_point_snapshot_import: {
+    sql: 'select strafe_api.api_finalize_point_snapshot_import($1::text) as value',
+    args: ['p_key_hash'],
   },
   sync_point_profiles: {
     sql: 'select strafe_api.api_sync_point_profiles($1::text, $2::jsonb) as value',
@@ -782,6 +787,7 @@ function snapshotWriteResult(value: JsonRecord, apiKey: ApiKey): JsonRecord {
     ...(typeof value.insertedCount === 'number' ? { insertedCount: value.insertedCount } : {}),
     ...(typeof value.existingCount === 'number' ? { existingCount: value.existingCount } : {}),
     ...(typeof value.deletedCount === 'number' ? { deletedCount: value.deletedCount } : {}),
+    ...(typeof value.skippedCount === 'number' ? { skippedCount: value.skippedCount } : {}),
   };
 }
 
@@ -1748,6 +1754,9 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     const apiKey = await requireWriteKey(request);
     if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
     const body = await readJson(request);
+    if (body.createMissing !== undefined && typeof body.createMissing !== 'boolean') {
+      throw new HttpError(400, 'invalid_request', 'createMissing must be a boolean.');
+    }
     if (!Array.isArray(body.balances) || body.balances.length > SNAPSHOT_BATCH_MAX) {
       throw new HttpError(400, 'invalid_request', `balances must be an array with at most ${SNAPSHOT_BATCH_MAX} rows.`);
     }
@@ -1772,8 +1781,19 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     const result = await rpc<JsonRecord>('seed_point_snapshot', {
       p_key_hash: apiKey.key_hash,
       p_balances: balances,
+      p_create_missing: body.createMissing === true,
     });
     sendJson(response, 200, snapshotWriteResult(result, apiKey));
+    return;
+  }
+
+  if (pathname === '/v1/points/snapshot/finalize') {
+    const apiKey = await requireWriteKey(request);
+    if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
+    const result = await rpc<JsonRecord>('finalize_point_snapshot_import', {
+      p_key_hash: apiKey.key_hash,
+    });
+    sendJson(response, 200, result);
     return;
   }
 
