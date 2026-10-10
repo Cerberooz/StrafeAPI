@@ -347,6 +347,8 @@ Apply `20261010000000_season_kit_images.sql` with `pnpm migrate:prod`. In Supaba
 
 `GET /v1/leaderboards/seasons` includes `kitImageUrl` on each season and keeps its existing `leaderboards:read` permission. Runtime API credentials cannot modify season artwork. The website selects artwork using the viewed season, including historical seasons; its existing season metadata cache refreshes in 15 seconds.
 
+Apply `20261022000000_season_kit_html.sql` to add optional `point_seasons.kit_html` (up to 20,000 characters), exposed as `kitHtml` in the same seasons response. Administrators edit the fragment through Supabase Table Editor; runtime API credentials retain read-only access through the existing authenticated RPC. The WebApp sanitizes and renders the fragment with local vanilla icons and site typography. Null/empty content preserves the `kit_image_url` fallback. Formatting and the ready-to-paste Season 1 example are documented in the WebApp's `KIT_MARKUP.md` and `examples/season-1-kit.html`. Do not put secrets in this public presentation content.
+
 ## Storage retention and maintenance
 
 - `point_mutations` is the permanent idempotency ledger. Keep every event UUID, request hash, and stored response indefinitely: the plugin may replay an old outbox item after a long outage, and removing an event identity could apply that mutation twice. This table grows with successful writes; it has an age index for operations and appears in the storage metrics.
