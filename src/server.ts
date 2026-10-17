@@ -21,6 +21,8 @@ const FIXED_LOG_ROUTES = new Set([
   'POST /v1/points/profiles',
   'POST /v1/points/delete',
   'POST /v1/matches/settle',
+  'POST /v1/matches/authorize',
+  'POST /v1/competitive-region/check',
   'POST /v1/points/adjust',
   'POST /v1/points/set',
   'POST /v1/points/bulk',
@@ -41,6 +43,21 @@ const FIXED_LOG_ROUTES = new Set([
 type SubjectType = 'team' | 'player';
 type Scope = 'leaderboards:read' | 'points:read' | 'points:write' | 'accounts:read' | 'accounts:write' | 'accounts:admin' | 'tiers:moderate';
 type JsonRecord = Record<string, unknown>;
+const REGIONS = ['AS', 'EU', 'NA', 'SA', 'OC', 'AF'] as const;
+const REGIONAL_RPC_NAMES = new Set<string>([
+  'get_tier_profile', 'get_point_balance', 'get_points_snapshot', 'get_points_leaderboard',
+  'get_smp_leaderboard_seasons', 'get_points_leaderboard_for_season', 'mutate_points',
+  'seed_point_snapshot', 'finalize_point_snapshot_import', 'sync_point_profiles',
+]);
+
+function queryRegion(url: URL): string | null {
+  const values = url.searchParams.getAll('region');
+  if (values.length === 0) return null;
+  if (values.length !== 1 || !REGIONS.includes(values[0] as typeof REGIONS[number])) {
+    throw new HttpError(400, 'invalid_query', 'region must be AS, EU, NA, SA, OC, or AF.');
+  }
+  return values[0]!;
+}
 
 interface Balance {
   subjectType: SubjectType;
@@ -235,6 +252,14 @@ const RPC_CALLS = {
     sql: 'select strafe_api.api_mutate_points($1::text, $2::uuid, $3::text, $4::text, $5::jsonb) as value',
     args: ['p_key_hash', 'p_event_id', 'p_request_hash', 'p_operation', 'p_payload'],
   },
+  check_competitive_regions: {
+    sql: 'select strafe_api.api_check_competitive_regions($1::text, $2::uuid[]) as value',
+    args: ['p_key_hash', 'p_player_ids'],
+  },
+  authorize_competitive_match: {
+    sql: 'select strafe_api.api_authorize_competitive_match($1::text, $2::uuid, $3::uuid[], $4::text, $5::text, $6::uuid, $7::uuid) as value',
+    args: ['p_key_hash', 'p_match_id', 'p_player_ids', 'p_expected_region', 'p_subject_type', 'p_subject_a_id', 'p_subject_b_id'],
+  },
   seed_point_snapshot: {
     sql: 'select strafe_api.api_seed_point_snapshot($1::text, $2::jsonb, $3::boolean) as value',
     args: ['p_key_hash', 'p_balances', 'p_create_missing'],
@@ -332,6 +357,9 @@ let lastPortraitPruneAt = 0;
 
 function mapDatabaseError(error: unknown): never {
   const message = error instanceof Error ? error.message.toLowerCase() : '';
+  if (message.includes('api_key_region_denied')) {
+    throw new HttpError(403, 'region_forbidden', 'This points API key belongs to another region.');
+  }
   if (message.includes('idempotency_conflict')) {
     throw new HttpError(409, 'idempotency_conflict', 'This idempotency key was already used with a different request.');
   }
@@ -343,6 +371,12 @@ function mapDatabaseError(error: unknown): never {
   }
   if (message.includes('season_mismatch')) {
     throw new HttpError(409, 'season_mismatch', 'This match started before the active leaderboard season. Keep it queued for an administrator to review.');
+  }
+  if (message.includes('competitive_match_claim_required')) {
+    throw new HttpError(409, 'match_region_claim_required', 'This match has no competitive region authorization.');
+  }
+  if (message.includes('competitive_match_claim_conflict')) {
+    throw new HttpError(409, 'match_authorization_conflict', 'This match ID was already authorized for another roster or region.');
   }
   if (message.includes('api_key_scope_denied')) {
     throw new HttpError(403, 'forbidden', 'This API key does not have permission for this operation.');
@@ -356,6 +390,21 @@ function mapDatabaseError(error: unknown): never {
 async function rpc<T>(name: keyof typeof RPC_CALLS, parameters: JsonRecord): Promise<T> {
   const specification = RPC_CALLS[name];
   try {
+    if (REGIONAL_RPC_NAMES.has(name)) {
+      const args = {
+        p_key_hash: parameters.p_key_hash,
+        p_region: parameters.p_region ?? null,
+        p_call: name,
+        p_parameters: Object.fromEntries(specification.args.filter(key => key !== 'p_key_hash').map(key => [key, parameters[key]])),
+      };
+      if (supabase) return await supabase.call<T>('regional_points_call', args);
+      const result = await databasePool!.query<{ value: T }>(
+        'select strafe_api.regional_points_call($1::text, $2::text, $3::text, $4::jsonb) as value',
+        [args.p_key_hash, args.p_region, args.p_call, JSON.stringify(args.p_parameters)],
+      );
+      if (!result.rows[0]) throw new BackendError();
+      return result.rows[0].value;
+    }
     if (supabase) {
       const functionName = /strafe_api\.([a-z_]+)\(/.exec(specification.sql)?.[1];
       if (!functionName) throw new BackendError();
@@ -577,6 +626,26 @@ function parseUuid(value: unknown, label: string): string {
     throw new HttpError(400, 'invalid_request', `${label} must be a UUID.`);
   }
   return value.toLowerCase();
+}
+
+function parseCompetitivePlayerIds(value: unknown, minimum: number): string[] {
+  if (!Array.isArray(value) || value.length < minimum || value.length > 1_000) {
+    throw new HttpError(400, 'invalid_request', `playerIds must contain ${minimum} to 1,000 UUIDs.`);
+  }
+  const ids = value.map((id, index) => parseUuid(id, `playerIds[${index}]`));
+  if (new Set(ids).size !== ids.length) {
+    throw new HttpError(400, 'invalid_request', 'playerIds cannot contain duplicates.');
+  }
+  return ids.sort();
+}
+
+function parseCompetitiveRegion(value: unknown): typeof REGIONS[number] {
+  if (typeof value !== 'string') throw new HttpError(400, 'invalid_request', 'expectedRegion must be a supported region code.');
+  const region = value.trim().toUpperCase();
+  if (!(REGIONS as readonly string[]).includes(region)) {
+    throw new HttpError(400, 'invalid_request', 'expectedRegion must be AS, EU, NA, SA, OC, or AF.');
+  }
+  return region as typeof REGIONS[number];
 }
 
 function parseSubjectType(value: unknown): SubjectType {
@@ -1663,12 +1732,12 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     const apiKey = await requireLeaderboardKey(request);
     if (!enforceRateLimit(response, accountKeyBucket(apiKey), keyLimiter, requestId)) return;
     const names = url.searchParams.getAll('name');
-    if (names.length !== 1 || [...url.searchParams.keys()].some(key => key !== 'name')) {
-      throw new HttpError(400, 'invalid_query', 'Provide one name query parameter.');
+    if (names.length !== 1 || [...url.searchParams.keys()].some(key => !['name', 'region'].includes(key))) {
+      throw new HttpError(400, 'invalid_query', 'Provide one name and an optional region query parameter.');
     }
     const name = parseText(names[0], 'name', 16);
     if (!/^[A-Za-z0-9_]{1,16}$/.test(name)) throw new HttpError(400, 'invalid_query', 'name must be a Minecraft username.');
-    const result = await rpc<JsonRecord>('get_tier_profile', { p_key_hash: apiKey.key_hash, p_name: name });
+    const result = await rpc<JsonRecord>('get_tier_profile', { p_key_hash: apiKey.key_hash, p_name: name, p_region: queryRegion(url) });
     if (result.code === 'player_not_found') throw new HttpError(404, 'player_not_found', 'No public tier profile was found for that player.');
     if (result.code === 'ambiguous_player_name') throw new HttpError(409, 'ambiguous_player_name', 'More than one account uses that name. Contact a server administrator.');
     if (!Array.isArray(result.standings) || typeof result.playerId !== 'string' || !UUID_PATTERN.test(result.playerId)) throw new BackendError();
@@ -1679,7 +1748,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   if (method === 'GET' && pathname === '/v1/leaderboards/seasons') {
     const apiKey = await requireLeaderboardKey(request);
     if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
-    const result = await rpc<JsonRecord>('get_smp_leaderboard_seasons', { p_key_hash: apiKey.key_hash });
+    const result = await rpc<JsonRecord>('get_smp_leaderboard_seasons', { p_key_hash: apiKey.key_hash, p_region: queryRegion(url) });
     sendJson(response, 200, result);
     return;
   }
@@ -1706,6 +1775,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
       p_offset: offset,
       p_mode: mode,
       p_season: season,
+      p_region: queryRegion(url),
     });
     sendJson(response, 200, result);
     return;
@@ -1847,7 +1917,60 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
 
-  if (pathname === '/v1/matches/settle') {
+  if (method === 'POST' && pathname === '/v1/competitive-region/check') {
+    const apiKey = await requireWriteKey(request);
+    if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
+    const body = await readJson(request);
+    const playerIds = parseCompetitivePlayerIds(body.playerIds, 1);
+    const result = await rpc<JsonRecord>('check_competitive_regions', {
+      p_key_hash: apiKey.key_hash,
+      p_player_ids: playerIds,
+    });
+    sendJson(response, 200, result);
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/v1/matches/authorize') {
+    const apiKey = await requireWriteKey(request);
+    if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
+    const body = await readJson(request);
+    const matchId = parseUuid(body.matchId, 'matchId');
+    assertHeaderMatchesBody(eventIdFromHeader(request), matchId);
+    const playerIds = parseCompetitivePlayerIds(body.playerIds, 2);
+    const expectedRegion = parseCompetitiveRegion(body.expectedRegion);
+    const subjectType = parseSubjectType(body.subjectType);
+    const subjectAId = parseUuid(body.subjectAId, 'subjectAId');
+    const subjectBId = parseUuid(body.subjectBId, 'subjectBId');
+    if (subjectAId === subjectBId) throw new HttpError(400, 'invalid_request', 'A match must have two different subjects.');
+    const result = await rpc<JsonRecord>('authorize_competitive_match', {
+      p_key_hash: apiKey.key_hash,
+      p_match_id: matchId,
+      p_player_ids: playerIds,
+      p_expected_region: expectedRegion,
+      p_subject_type: subjectType,
+      p_subject_a_id: subjectAId,
+      p_subject_b_id: subjectBId,
+    });
+    if (result.reason === 'server_region_mismatch') {
+      throw new HttpError(409, 'competitive_server_region_mismatch', 'This server configuration does not match its points API key region.', {
+        configuredRegion: expectedRegion,
+        serverRegion: typeof result.region === 'string' ? result.region : undefined,
+      });
+    }
+    if (result.allowed !== true) {
+      const playerId = typeof result.conflictPlayerId === 'string' ? result.conflictPlayerId : undefined;
+      const lockedRegion = typeof result.conflictRegion === 'string' ? result.conflictRegion : undefined;
+      throw new HttpError(409, 'competitive_region_conflict', 'One or more participants are locked to another competitive region.', {
+        ...(playerId ? { playerId } : {}),
+        ...(lockedRegion ? { lockedRegion } : {}),
+        serverRegion: typeof result.region === 'string' ? result.region : undefined,
+      });
+    }
+    sendJson(response, 200, result);
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/v1/matches/settle') {
     const apiKey = await requireWriteKey(request);
     if (!enforceRateLimit(response, `key:${createHash('sha256').update(apiKey.id).digest('hex')}`, keyLimiter, requestId)) return;
     const body = await readJson(request);

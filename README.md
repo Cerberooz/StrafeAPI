@@ -1,5 +1,9 @@
 # Strafe points API
 
+## Consistent leaderboard ties
+
+Apply `20261023000000_consistent_leaderboard_ties.sql` using `pnpm migrate:prod` and deploy the matching StrafeSMPCore and WebApp builds. Team and Solo standings sort by points descending, then UUID ascending. API `rank` and Discord profile `rank`/`position` are unique ordinal positions, including historical season projections. Display names are not used to break ties. No balances or match records are rewritten; only tied placements and their percentile tiers can change. Existing filtering for banned players, deleted teams and historical seasons is retained. Cache and plugin balance-sync delays can still cause temporary differences.
+
 ## Discord tier profiles
 
 `GET /v1/tiers/profile?name=<Minecraft username>` requires a key with `leaderboards:read` and migration `20261020000000_discord_tier_profiles.sql`. It returns public account flags, canonical appearance identifiers, region, the active season ID, and the player's associated Team/Solo standings across seasons. The Discord app in `DiscordBots/StrafeTiers` chooses its highest tier independently for Team and Solo.
@@ -381,4 +385,8 @@ Apply migrations through `20261018000000_account_skin_half_hour_mirror.sql` with
 Velocity resolves and saves skins through its local SkinsRestorer API, then sends signed canonical textures through the existing prepare/commit endpoints. Native SkinsRestorer changes are independent; Velocity checks its current saved selection after the API cooldown expires, and updates the website/NPC mirror only when the appearance differs. Premium leaderboard skins remain sourced from Minecraft. No new endpoint, permission scope, or shared SkinsRestorer database is needed.
 
 The proxy defaults to checking cracked SkinsRestorer selections every 30 minutes while connected. Its `skin.refresh-minutes` setting can increase the interval (for example 60 for hourly checks). Unchanged skins cause no write; explicit commands retain immediate updates and their independent rate limit.
+
+# Regional points
+
+Points records are isolated by the API key's immutable `point_region`. Existing records remain AS; additional regions start empty. See [REGIONAL_POINTS.md](REGIONAL_POINTS.md) for migration, key creation, regional reads, and maintenance. Deploy migration `20261024000000_isolated_region_records.sql` before this API version.
 

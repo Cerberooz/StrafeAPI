@@ -24,6 +24,8 @@ for (let index = 0; index < args.length; index += 1) {
 const label = values.get('label')?.trim();
 const scopesText = values.get('scopes') ?? 'points:read,points:write';
 const scopes = [...new Set(scopesText.split(',').map((scope) => scope.trim()).filter(Boolean))].sort();
+const region = (values.get('region') ?? 'AS').trim().toUpperCase();
+if (!['AS', 'EU', 'NA', 'SA', 'OC', 'AF'].includes(region)) throw new Error('--region must be AS, EU, NA, SA, OC, or AF.');
 
 if (!label || label.length > 80) {
   throw new Error('Pass --label with 1 to 80 characters.');
@@ -46,5 +48,7 @@ process.stdout.write([
   `key_prefix: ${JSON.stringify(prefix)}`,
   `key_hash: ${JSON.stringify(hash)}`,
   `scopes: ${JSON.stringify(pgArray)}`,
+  `point_region: ${JSON.stringify(region)}`,
+  'Set point_region when creating the row. Existing keys cannot change region.',
   '',
 ].join('\n'));
