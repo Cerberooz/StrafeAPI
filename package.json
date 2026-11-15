@@ -1,6 +1,6 @@
 {
   "name": "strafesmp-api-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.18.3",
@@ -9,6 +9,8 @@
   },
   "scripts": {
     "build:prod": "tsc -p tsconfig.prod.json",
+    "verify:proxy-balancer": "pnpm build:prod && node scripts/verify-proxy-balancer.mjs",
+    "verify:proxy-discovery": "pnpm build:prod && node scripts/verify-proxy-discovery.mjs",
     "start:prod": "node --env-file-if-exists=.env dist/server.js",
     "migrate:prod": "node --env-file-if-exists=.env scripts/migrate-prod.mjs",
     "account:recover": "node scripts/recover-account-link.mjs",
@@ -18,6 +20,7 @@
   },
   "dependencies": {
     "pg": "^8.23.1",
+    "redis": "^5.12.2",
     "sharp": "^0.35.5"
   },
   "devDependencies": {

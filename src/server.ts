@@ -7,6 +7,8 @@ import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import sharp from 'sharp';
 import { SupabaseRpc, SupabaseRpcError } from './supabase-rpc.js';
+import { proxyAdminActions, proxyBalancerActions, ProxyInputError, validateProxyBody } from './proxy-balancer.js';
+import { ProxyDiscovery, discoveredCall } from './proxy-discovery.js';
 
 const MAX_POINTS = 2_147_483_647;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -272,6 +274,14 @@ const RPC_CALLS = {
     sql: 'select strafe_api.api_sync_point_profiles($1::text, $2::jsonb) as value',
     args: ['p_key_hash', 'p_profiles'],
   },
+  proxy_balancer: {
+    sql: 'select strafe_api.proxy_balancer_call($1::text, $2::text, $3::jsonb) as value',
+    args: ['p_key_hash', 'p_action', 'p_body'],
+  },
+  proxy_admin_call: {
+    sql: 'select strafe_api.proxy_admin_call($1::text, $2::text, $3::jsonb) as value',
+    args: ['p_key_hash', 'p_action', 'p_body'],
+  },
   account_session_upsert: {
     sql: 'select strafe_api.api_account_session_upsert_with_tier_status($1::text, $2::uuid, $3::text, $4::boolean, $5::text, $6::timestamptz, $7::integer) as value',
     args: ['p_key_hash', 'p_player_id', 'p_player_name', 'p_premium', 'p_session_token_hash', 'p_session_started_at', 'p_ttl_seconds'],
@@ -344,6 +354,9 @@ const RPC_CALLS = {
 
 const ipLimiter = new RateLimiter(rateWindowMs, maxPerIp);
 const keyLimiter = new RateLimiter(rateWindowMs, maxPerKey);
+const proxyIpLimiter = new RateLimiter(rateWindowMs, readIntegerEnv('PROXY_RATE_LIMIT_MAX_PER_IP', 7200, 1, 100_000));
+const proxyKeyLimiter = new RateLimiter(rateWindowMs, readIntegerEnv('PROXY_RATE_LIMIT_MAX_PER_KEY', 1800, 1, 100_000));
+const proxyProbeKeyLimiter = new RateLimiter(rateWindowMs, readIntegerEnv('PROXY_PROBE_RATE_LIMIT_MAX_PER_KEY', 600, 1, 100_000));
 const portraitLimiter = new RateLimiter(rateWindowMs, Math.min(maxPerIp, 30));
 const pendingPortraits = new Map<string, Promise<Buffer>>();
 const portraitRegistrationCache = new Map<string, { checkedAt: number; registered: boolean }>();
@@ -593,14 +606,14 @@ function requireObject(value: unknown, label = 'Request body'): JsonRecord {
   return value as JsonRecord;
 }
 
-async function readJson(request: IncomingMessage): Promise<JsonRecord> {
+async function readJson(request: IncomingMessage, limit = MAX_BODY_BYTES): Promise<JsonRecord> {
   const mediaType = request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase();
   if (mediaType !== 'application/json') {
     throw new HttpError(415, 'unsupported_media_type', 'Send a JSON request body.');
   }
 
   const contentLength = Number(request.headers['content-length'] ?? 0);
-  if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
+  if (Number.isFinite(contentLength) && contentLength > limit) {
     throw new HttpError(413, 'request_too_large', 'The request body is too large.');
   }
 
@@ -609,7 +622,7 @@ async function readJson(request: IncomingMessage): Promise<JsonRecord> {
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.byteLength;
-    if (size > MAX_BODY_BYTES) throw new HttpError(413, 'request_too_large', 'The request body is too large.');
+    if (size > limit) throw new HttpError(413, 'request_too_large', 'The request body is too large.');
     chunks.push(buffer);
   }
 
@@ -1359,6 +1372,37 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     throw new HttpError(404, 'not_found', 'The requested route was not found.');
   }
 
+  if (pathname.startsWith('/v1/proxy-balancer/')) {
+    const action = pathname.slice('/v1/proxy-balancer/'.length);
+    if (method !== 'POST' || !proxyBalancerActions.has(action)) throw new HttpError(404, 'not_found', 'The requested route was not found.');
+    if (!enforceRateLimit(response, clientAddress(request), proxyIpLimiter, requestId)) return;
+    const key = await requireAccountsWriteKey(request);
+    const limiter = action.startsWith('probe-') ? proxyProbeKeyLimiter : proxyKeyLimiter;
+    if (!enforceRateLimit(response, accountKeyBucket(key), limiter, requestId)) return;
+    let body: JsonRecord;
+    try { body = validateProxyBody(action, await readJson(request, 32768)); }
+    catch (error) { if (error instanceof ProxyInputError) throw new HttpError(400,'invalid_request',error.message); throw error; }
+    if (proxyAdminActions.has(action)) {
+      const result = await rpc<JsonRecord>('proxy_admin_call', { p_key_hash: key.key_hash, p_action: action, p_body: body });
+      sendJson(response, 200, result);
+      return;
+    }
+    if (body.registration !== undefined) {
+      const registration = body.registration as JsonRecord;
+      if (!proxyDiscovery || !discoveryPools.has(String(registration.pool)))
+        throw new HttpError(503,'discovery_unavailable','Proxy self-registration is unavailable for this pool.');
+    }
+    const ticket = action === 'handoff-create' ? randomBytes(32).toString('hex') : null;
+    if (ticket) body.ticketHash = createHash('sha256').update(ticket).digest('hex');
+    const call = (action: string, body: JsonRecord) => rpc<JsonRecord>('proxy_balancer', { p_key_hash: key.key_hash, p_action: action, p_body: body });
+    let result: JsonRecord;
+    if (proxyDiscovery) {
+      try { result = await discoveredCall(proxyDiscovery,action,body,call); }
+      catch { throw new HttpError(503,'discovery_unavailable','Proxy discovery is temporarily unavailable.'); }
+    } else result = await call(action,body);
+    sendJson(response, 200, ticket && result.ok === true ? { ...result, ticket } : result);
+    return;
+  }
   if (!enforceRateLimit(response, clientAddress(request), ipLimiter, requestId)) return;
 
   if (method === 'GET' && pathname === '/v1/accounts/oauth/start') {
@@ -2124,6 +2168,8 @@ function routeForLog(request: IncomingMessage): string {
   }
   if (method === 'GET' && /^\/v1\/accounts\/[^/]+$/.test(pathname)) return '/v1/accounts/:playerId';
   if (method === 'GET' && pathname === '/v1/tiers/profile') return pathname;
+  if (method === 'POST' && pathname.startsWith('/v1/proxy-balancer/')
+      && proxyBalancerActions.has(pathname.slice('/v1/proxy-balancer/'.length))) return pathname;
   if (FIXED_LOG_ROUTES.has(`${method} ${pathname}`)) return pathname;
   if (method === 'GET' && pathname === '/v1/leaderboards/seasons') return pathname;
   if (method === 'GET' && /^\/v1\/leaderboards\/(smp-teams|smp-solo|pvp)$/.test(pathname)) {
@@ -2138,6 +2184,12 @@ function routeForLog(request: IncomingMessage): string {
 }
 
 let inFlightRequests = 0;
+
+const discoveryPools = new Set((process.env.PROXY_DISCOVERY_POOLS ?? '').split(',').map(p => p.trim()).filter(Boolean));
+if ([...discoveryPools].some(p => !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(p))) throw new Error('Invalid PROXY_DISCOVERY_POOLS.');
+const redisUrl = process.env.PROXY_REDIS_URL?.trim();
+if (discoveryPools.size && !redisUrl) throw new Error('PROXY_REDIS_URL is required for proxy discovery.');
+const proxyDiscovery = redisUrl ? new ProxyDiscovery(redisUrl, process.env.PROXY_REDIS_PREFIX ?? 'strafe:proxy:') : null;
 
 const server = createServer(async (request, response) => {
   const requestId = randomUUID();
@@ -2201,6 +2253,7 @@ function shutdown(signal: string): void {
   forceClose.unref();
   server.close((error) => {
     clearTimeout(forceClose);
+    proxyDiscovery?.close();
     void databasePool?.end().catch(() => {
       process.stderr.write('Database pool shutdown failed.\n');
       process.exitCode = 1;
