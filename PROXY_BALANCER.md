@@ -30,6 +30,13 @@ The API will not steal a live proxy identity on a changed process instance: a re
 
 ## HTTP contract
 
+For backend `/proxy` commands with fresh estimates on every opening, apply
+`20261115010000_proxy_menu_refresh.sql` and update both Velocity and the Paper companion.
+The authenticated `probe-create` call reuses a matching active job, and creates a new
+job immediately after expiry instead of imposing the previous 30-second cooldown.
+The 32-active-job source cap, API rate limits, and account-session checks remain.
+Opening the selector does not change the player's saved proxy preference.
+
 All routes are `POST /v1/proxy-balancer/<action>` with JSON and a bearer `ssmp_live_...` API key. The database binds each key to one enabled proxy node, creating the row on the first permitted self-registration heartbeat. Requests are limited to 32 KiB; balancer control traffic has a separate 1800/key budget, probe actions have their own 600/key budget, and all balancer traffic shares a 7200/IP fixed-window ceiling. Probe polling cannot exhaust control/heartbeat/drain budgets. Optional `PROXY_RATE_LIMIT_MAX_PER_KEY`, `PROXY_PROBE_RATE_LIMIT_MAX_PER_KEY`, and `PROXY_RATE_LIMIT_MAX_PER_IP` tune these limits; the existing global in-flight limit still applies. Error details never expose raw session tokens, IP addresses or tickets in logs.
 
 Every action carries the immutable running-process `instanceId` UUID. Non-heartbeat calls must match the registered generation and a fresh heartbeat; register with heartbeat before making other requests. Late callbacks from a former process are rejected even when the API key is unchanged.

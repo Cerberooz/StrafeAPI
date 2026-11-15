@@ -32,6 +32,7 @@ try {
  await db.exec(await readFile(new URL('../supabase/migrations/20261103000000_proxy_balancer.sql',import.meta.url),'utf8'));
  await db.exec(await readFile(new URL('../supabase/migrations/20261113000000_proxy_discovery.sql',import.meta.url),'utf8'));
  await db.exec(await readFile(new URL('../supabase/migrations/20261115000000_proxy_admin.sql',import.meta.url),'utf8'));
+ await db.exec(await readFile(new URL('../supabase/migrations/20261115010000_proxy_menu_refresh.sql',import.meta.url),'utf8'));
  const key1=randomUUID(),key2=randomUUID(),key3=randomUUID(),inst1=randomUUID(),inst2=randomUUID();
  for(const [id,key] of [[key1,'key1'],[key2,'key2'],[key3,'key3']])await db.query(`insert into public.api_keys values($1,$2,array['accounts:write'])`,[id,key]);
  for(const [id,key,pool] of [['sg1',key1,'as'],['sg2',key2,'as'],['eu',key3,'eu']])await db.query(`insert into strafe_api.proxy_nodes(id,pool,api_key_id,region,name,host,backends) values($1,$2,$3,'AS',$1,'example.com','{"smp":"smp","pvp":"pvp"}')`,[id,pool,key]);
@@ -76,7 +77,17 @@ try {
  check((await call('key3','probe-jobs')).probeJobs.length===0,'other pool cannot see IP');
  check((await call('key2','probe-result',{id:probe.id,pingMs:12})).ok,'probe report');
  check((await call('key1','probe-read',{id:probe.id})).results[0].pingMs===12,'source reads remote estimate');
- check((await call('key1','probe-create',{playerId:player,sessionHash:hash(raw),ip:'8.8.8.8'})).code==='probe_rate_limited','probe spam capped');
+ check((await call('key1','probe-create',{playerId:player,sessionHash:hash(raw),ip:'8.8.8.8'})).id===probe.id,'repeated opening shares active probe');
+ check((await call('key1','probe-create',{playerId:player,sessionHash:hash('wrong-session'),ip:'8.8.8.8'})).code==='stale_session','active probe reuse still requires the current session');
+ await db.query("update strafe_api.proxy_probe_jobs set expires_at=now()-interval '1 second' where id=$1",[probe.id]);
+ const refreshedProbe=await call('key1','probe-create',{playerId:player,sessionHash:hash(raw),ip:'8.8.8.8'});
+ check(refreshedProbe.ok&&refreshedProbe.id!==probe.id,'next opening starts a fresh probe without a 30-second cooldown');
+ check((await call('key1','probe-read',{id:refreshedProbe.id})).results.length===0,'fresh probe has no stale estimates');
+ await db.query("insert into strafe_api.proxy_probe_jobs(source_proxy,player_id,pool,ip) select 'sg1',gen_random_uuid(),'as','8.8.8.8'::inet from generate_series(1,31)");
+ check((await call('key1','probe-create',{playerId:player,sessionHash:hash(raw),ip:'8.8.8.8'})).id===refreshedProbe.id,'active probe reuse works at source capacity');
+ await db.query("update strafe_api.proxy_probe_jobs set expires_at=now()-interval '1 second' where id=$1",[refreshedProbe.id]);
+ await db.query("insert into strafe_api.proxy_probe_jobs(source_proxy,player_id,pool,ip) values('sg1',gen_random_uuid(),'as','8.8.8.8')");
+ check((await call('key1','probe-create',{playerId:player,sessionHash:hash(raw),ip:'8.8.8.8'})).code==='probe_rate_limited','source cap still blocks excessive concurrent probes');
  const ticketRaw='b'.repeat(64),ticketHash=hash(ticketRaw);
  check((await call('key1','handoff-create',{playerId:player,sourceSessionHash:hash(raw),targetProxyId:'sg2',targetInstanceId:randomUUID(),backend:'smp',reason:'drain',preferenceRevision:1,ticketHash:hash('wrong-generation')})).code==='proxy_unavailable','destination restart cannot redirect an old selection');
  const hand=await call('key1','handoff-create',{playerId:player,sourceSessionHash:hash(raw),targetProxyId:'sg2',backend:'smp',reason:'drain',preferenceRevision:1,ticketHash});
