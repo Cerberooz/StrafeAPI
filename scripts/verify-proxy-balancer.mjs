@@ -162,5 +162,45 @@ try {
  check((await call('intruder','heartbeat',{...hb(instances.intruder),registration})).code==='proxy_identity_conflict','different credential cannot steal existing ID');
  await db.query("update strafe_api.proxy_nodes set enabled=false where id='sg4'");
  check((await call('key4','heartbeat',{...hb(instances.key4,2),registration})).code==='proxy_identity_conflict','disabled identity cannot self-enable');
+
+ // Upgrade databases that contain both auto-saved defaults and real manual choices.
+ const automaticPlayer = randomUUID(), manualPlayer = randomUUID(), newPlayer = randomUUID();
+ const sourceHash = hash('preference-fixture-source'), arrivedHash = hash('preference-fixture-arrival');
+ for (const id of [automaticPlayer, manualPlayer, newPlayer]) {
+   const created = await db.query(
+     "select strafe_api.api_account_session_upsert('key1',$1,'Player',false,$2,now(),180) as v",
+     [id,sourceHash]);
+   check(created.rows[0].v.ok,'registered player for migration fixture');
+ }
+ const beginMove = (id,reason,revision,ticketHash) => call('key1','handoff-create',{
+   playerId:id, sourceSessionHash:sourceHash, targetProxyId:'sg2', backend:'smp', reason, preferenceRevision:revision, ticketHash
+ });
+ const completeMove = async (id,handoffId,ticketHash) => {
+   const claimed = await call('key2','handoff-consume',{playerId:id,ticketHash,claimSessionHash:arrivedHash});
+   check(claimed.handoffId===handoffId,'destination claims preference test handoff');
+   return call('key2','handoff-complete',{playerId:id,handoffId,sessionHash:arrivedHash,playerName:'Player',premium:false,backend:'smp'});
+ };
+ const legacy = await call('key1','preference-save',{playerId:automaticPlayer,proxyId:'sg1',expectedRevision:0,sessionHash:sourceHash});
+ check(legacy.preferenceSaved,'old release can save an automatic default');
+ const firstManual = await beginMove(manualPlayer,'manual',0,hash('old-first-manual'));
+ check((await completeMove(manualPlayer,firstManual.handoffId,hash('old-first-manual'))).preferenceSaved,'old first manual choice is revision 1');
+
+ await db.exec(await readFile(new URL('../supabase/migrations/20261116000000_manual_proxy_preferences.sql',import.meta.url),'utf8'));
+ const automatic = await call('key1','preference',{playerId:automaticPlayer});
+ check(automatic.proxyId===null && automatic.revision===1,'automatic preference ignored with revision retained for manual replacement');
+ check((await call('key1','preference',{playerId:manualPlayer})).proxyId==='sg2','retained manual handoff verifies a revision-1 preference');
+ check((await call('key1','preference',{playerId:player})).proxyId==='sg1','revised legacy manual choice preserved');
+ const outdated = await call('key1','preference-save',{playerId:newPlayer,proxyId:'sg1',expectedRevision:0,sessionHash:sourceHash});
+ check(outdated.ok && !outdated.preferenceSaved,'legacy automatic preference write is a no-op');
+ check((await beginMove(newPlayer,'initial',0,hash('no-initial'))).code==='initial_routing_disabled','legacy automatic routing can no longer create a ticket');
+ check((await call('key1','preference',{playerId:newPlayer})).revision===0,'login leaves preference unset');
+ for (const [id,revision] of [[automaticPlayer,1],[newPlayer,0]]) {
+   const ticketHash=hash('new-manual-'+id);
+   const handoff=await beginMove(id,'manual',revision,ticketHash);
+   check(handoff.ok,'manual transfer can create a ticket');
+   check((await call('key1','preference',{playerId:id})).proxyId===null,'creating a manual ticket leaves preference unset');
+   check((await completeMove(id,handoff.handoffId,ticketHash)).preferenceSaved,'successful manual transfer saves the preference');
+   check((await call('key1','preference',{playerId:id})).proxyId==='sg2','login through another proxy sees the new preference');
+ }
  console.log(`Proxy Balancer verification passed: ${checks} checks (PostgreSQL/PGlite, actual prior account-session function)`);
 }finally{await db.close();}

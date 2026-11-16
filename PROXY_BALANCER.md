@@ -47,8 +47,8 @@ Successful domain results use `ok:true`; safe rejections use `ok:false,code:<rea
 | --- | --- | --- |
 | heartbeat | instanceId UUID, increasing sequence, state READY/DRAINING, players, cpu/heap fractions or null, schedulerDelayMs or null, backends logical-ready list; optional registration: id/pool/region/name/host/port/priority/capacity/headTexture/backends map | proxyId, pool, regional proxies, probeJobs, serverTime |
 | catalog | empty object | same catalog fields |
-| preference | playerId | proxyId or null, revision (0 when absent) |
-| preference-save | playerId, sessionToken, expectedRevision, proxyId (self) | preferenceSaved, proxyId, revision; initializes only an absent preference |
+| preference | playerId | manual proxyId or null, revision (0 when no stored row) |
+| preference-save | playerId, sessionToken, expectedRevision, proxyId (self) | Legacy compatibility. Returns preferenceSaved: false. |
 | probe-create | playerId, sessionToken, observed public literal ip | id |
 | probe-jobs | empty object | probeJobs: id/ip/expiresAt |
 | probe-result | id, pingMs (number or null) | ok |
@@ -70,7 +70,7 @@ Catalog entries contain id/pool/region/name/host/port/priority/capacity/headText
   roster page or runs a selected move or directed drain. Requests are claimed once and expire
   after 30 seconds. Roster responses contain player names and opaque connection identities.
 
-- `proxy_preferences` is separate from current presence and scoped by player UUID plus pool. Initial saves only insert; manual completion uses the captured revision. `preferred`, `drain` and `health` handoffs never update preference. `/server` does not write this API state.
+- `proxy_preferences` is scoped by player UUID plus pool. Only a completed manual handoff saves a preference, using the captured revision. The `20261116000000_manual_proxy_preferences.sql` migration keeps confirmed legacy manual choices and ignores older entries when their origin cannot be verified. Existing initial handoffs can finish account transfer, and new initial handoff requests are rejected.
 - Probe jobs require the source's live authenticated account session and a public literal IP. Jobs accept results for four seconds. Expired IPs are scrubbed on subsequent authenticated API work; results remain readable for 30 additional seconds, then bounded cleanup removes the job. These are logical expiry/cleanup intervals: if the whole API is idle or offline, physical deletion waits for the next authenticated call. No raw IP is logged; different pools cannot retrieve these jobs. At most 32 active source jobs and one per player/source per 30 seconds are admitted.
 - Tickets are stored hashed, expire after 60 seconds, and bind player, pool, source/destination process instances, backend, reason and source nonce. The destination claims a ticket once for its new session nonce. Retries for that exact nonce are idempotent; a cookie replay from another connection is rejected. The destination must authenticate normally before claiming, route to the mapped backend, and complete only after that backend confirms connection.
 - Completion atomically changes account-session ownership to the destination key/new nonce and permanently retires the source nonce. A late source heartbeat remains rejected even with a future local timestamp; source disconnect/end cannot clear the destination. Existing ordinary login policy remains unchanged. Tier-ban/session advisory locks use one consistent order.
