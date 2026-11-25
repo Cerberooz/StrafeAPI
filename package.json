@@ -11,6 +11,7 @@
     "build:prod": "tsc -p tsconfig.prod.json",
     "verify:proxy-balancer": "pnpm build:prod && node scripts/verify-proxy-balancer.mjs",
     "verify:proxy-discovery": "pnpm build:prod && node scripts/verify-proxy-discovery.mjs",
+    "verify:conditional-reads": "pnpm build:prod && node --test scripts/verify-conditional-reads.mjs",
     "start:prod": "node --env-file-if-exists=.env dist/server.js",
     "migrate:prod": "node --env-file-if-exists=.env scripts/migrate-prod.mjs",
     "account:recover": "node scripts/recover-account-link.mjs",

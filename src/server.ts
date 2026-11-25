@@ -7,6 +7,7 @@ import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import sharp from 'sharp';
 import { SupabaseRpc, SupabaseRpcError } from './supabase-rpc.js';
+import { ConditionalReads, supportsConditionalRead } from './conditional-reads.js';
 import { proxyAdminActions, proxyBalancerActions, ProxyInputError, validateProxyBody } from './proxy-balancer.js';
 import { ProxyDiscovery, discoveredCall } from './proxy-discovery.js';
 
@@ -400,9 +401,22 @@ function mapDatabaseError(error: unknown): never {
   throw new BackendError();
 }
 
-async function rpc<T>(name: keyof typeof RPC_CALLS, parameters: JsonRecord): Promise<T> {
+const conditionalReads = new ConditionalReads(32 * 1024 * 1024, 512, Date.now, 256);
+async function rpc<T>(name: keyof typeof RPC_CALLS, parameters: JsonRecord, conditional = true): Promise<T> {
   const specification = RPC_CALLS[name];
   try {
+    if (conditional && process.env.API_CONDITIONAL_READS !== 'false' && supportsConditionalRead(name, parameters)) {
+      return await conditionalReads.read<T>(name, parameters, async digest => {
+        const args = { p_key_hash: parameters.p_key_hash, p_call: name,
+          p_parameters: Object.fromEntries(Object.entries(parameters).filter(([key]) => key !== 'p_key_hash')), p_digest: digest };
+        if (supabase) return supabase.call('api_read_if_changed', args);
+        const result = await databasePool!.query<{ value: unknown }>(
+          'select strafe_api.api_read_if_changed($1::text, $2::text, $3::jsonb, $4::text) as value',
+          [args.p_key_hash, args.p_call, JSON.stringify(args.p_parameters), args.p_digest]);
+        if (!result.rows[0]) throw new BackendError();
+        return result.rows[0].value;
+      }, () => rpc<T>(name, parameters, false));
+    }
     if (REGIONAL_RPC_NAMES.has(name)) {
       const args = {
         p_key_hash: parameters.p_key_hash,

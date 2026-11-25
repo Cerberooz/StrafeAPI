@@ -12,6 +12,7 @@ export class SupabaseRpcError extends Error {
 
 export class SupabaseRpc {
   private readonly origin: string;
+  private readonly traffic = new Map<string, { calls: number; bytes: number }>();
   constructor(url: string, private readonly secret: string) {
     const parsed = new URL(url);
     if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/') {
@@ -19,6 +20,13 @@ export class SupabaseRpc {
     }
     if (!secret.startsWith('sb_secret_')) throw new Error('SUPABASE_SECRET_KEY must be a server-only sb_secret_ key.');
     this.origin = parsed.origin;
+    setInterval(() => {
+      for (const [rpc, usage] of this.traffic) process.stdout.write(`${JSON.stringify({
+        event: 'supabase_rpc_traffic', windowSeconds: 60, rpc, calls: usage.calls,
+        decodedResponseBytes: usage.bytes,
+      })}\n`);
+      this.traffic.clear();
+    }, 60_000).unref();
   }
   async call<T>(name: string, parameters: Record<string, unknown>): Promise<T> {
     if (!/^[a-z_]+$/.test(name)) throw new Error('Invalid RPC name');
@@ -40,6 +48,10 @@ export class SupabaseRpc {
         chunks.push(value);
       }
     } finally { await reader.cancel().catch(() => {}); }
+    const operation = name === 'api_read_if_changed' && typeof parameters.p_call === 'string' && /^[a-z_]{1,64}$/.test(parameters.p_call)
+      ? `${name}:${parameters.p_call}` : name;
+    const usage = this.traffic.get(operation) ?? { calls: 0, bytes: 0 };
+    usage.calls++; usage.bytes += size; this.traffic.set(operation, usage);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (!response.ok) {
       // Only PostgreSQL application exceptions participate in the API's error mapping.

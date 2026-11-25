@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { validateProxyBody, publicProbeIp } from '../dist/proxy-balancer.js';
+import { ConditionalReads } from '../dist/conditional-reads.js';
 let checks=0; const check=(v,label)=>{assert.ok(v,label);checks++;};
 for(const ip of ['127.0.0.1','10.0.0.1','192.168.1.1','172.20.0.1','169.254.1.1','0.0.0.0','224.0.0.1','::1','2::1','fc00::1','fe80::1','::ffff:127.0.0.1','localhost','8.8.8.8;whoami'])check(!publicProbeIp(ip),'private or invalid probe IP rejected');
 for(const ip of ['8.8.8.8','1.1.1.1','2606:4700:4700::1111'])check(publicProbeIp(ip),'public literal probe IP accepted');
@@ -33,6 +34,7 @@ try {
  await db.exec(await readFile(new URL('../supabase/migrations/20261113000000_proxy_discovery.sql',import.meta.url),'utf8'));
  await db.exec(await readFile(new URL('../supabase/migrations/20261115000000_proxy_admin.sql',import.meta.url),'utf8'));
  await db.exec(await readFile(new URL('../supabase/migrations/20261115010000_proxy_menu_refresh.sql',import.meta.url),'utf8'));
+ await db.exec(await readFile(new URL('../supabase/migrations/20261125000000_conditional_api_reads.sql',import.meta.url),'utf8'));
  const key1=randomUUID(),key2=randomUUID(),key3=randomUUID(),inst1=randomUUID(),inst2=randomUUID();
  for(const [id,key] of [[key1,'key1'],[key2,'key2'],[key3,'key3']])await db.query(`insert into public.api_keys values($1,$2,array['accounts:write'])`,[id,key]);
  for(const [id,key,pool] of [['sg1',key1,'as'],['sg2',key2,'as'],['eu',key3,'eu']])await db.query(`insert into strafe_api.proxy_nodes(id,pool,api_key_id,region,name,host,backends) values($1,$2,$3,'AS',$1,'example.com','{"smp":"smp","pvp":"pvp"}')`,[id,pool,key]);
@@ -44,6 +46,34 @@ try {
  await call('key3','heartbeat',hb(instances.key3));
  check((await call('key1','heartbeat',hb(inst1))).code==='stale_proxy_instance','out of order heartbeat rejected');
  const catalog=await call('key1','catalog');check(catalog.proxies.length===2,'regional catalog isolation');
+ const conditional = new ConditionalReads();
+ let pollBytes=0, ordinaryBytes=0, validations=0;
+ const compactPoll=async(action='probe-jobs',body={})=>{
+   const parameters={p_key_hash:'key1',p_action:action,p_body:{instanceId:inst1,...body}};
+   return conditional.read('proxy_balancer',parameters,async digest=>{
+     const envelope=(await db.query('select strafe_api.api_read_if_changed($1,$2,$3::jsonb,$4) as v',
+       ['key1','proxy_balancer',JSON.stringify({p_action:action,p_body:parameters.p_body}),digest])).rows[0].v;
+     pollBytes+=Buffer.byteLength(JSON.stringify(envelope)); validations++;
+     return envelope;
+   },()=>{throw new Error('Unexpected legacy fallback');});
+ };
+ await db.query("update strafe_api.proxy_nodes set head_texture=$1 where pool='as'",['fixture-texture-'.repeat(100)]);
+ for(let i=0;i<12;i++) {
+   const normal=await call('key1','probe-jobs');
+   ordinaryBytes+=Buffer.byteLength(JSON.stringify(normal));
+   const compact=await compactPoll();
+   const {serverTime:ignored,...normalBody}=normal,{serverTime:alsoIgnored,...compactBody}=compact;
+   assert.deepEqual(compactBody,normalBody,'compact SQL transport reconstructs the exact old proxy response');checks++;
+ }
+ check(pollBytes<ordinaryBytes*.5,'repeated probe catalog response bytes drop by more than half in the fixture');
+ await db.query("update strafe_api.proxy_nodes set state='DRAINING',players=42,heap=.9 where id='sg2'");
+ const live=(await compactPoll()).proxies.find(n=>n.id==='sg2');
+ check(live.state==='DRAINING'&&live.players===42&&live.heap===.9,'compact poll never freezes live proxy health/counts');
+ await db.query("update strafe_api.proxy_nodes set name='Renamed destination' where id='sg2'");
+ check((await compactPoll()).proxies.find(n=>n.id==='sg2').name==='Renamed destination','static catalog edits invalidate the cached dictionary');
+ await db.query("update strafe_api.proxy_nodes set state='READY',players=1,heap=.3,name='sg2' where id='sg2'");
+ check(validations===14,'every optimized proxy poll still executes the fenced SQL operation');
+ console.log(`Proxy fixture transport bytes: ordinary=${ordinaryBytes}, conditional=${pollBytes}`);
  check((await call('key1','preference',{playerId:player})).revision===0,'no initial preference');
  const upsert=async(key,token,when='now()')=>(await db.query(`select strafe_api.api_account_session_upsert($1,$2,'Player',false,$3,${when},180) as v`,[key,player,token])).rows[0].v;
  check((await upsert('key1',hash(raw))).ok,'ordinary source session');

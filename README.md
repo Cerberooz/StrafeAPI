@@ -16,6 +16,10 @@ The API keeps live balances in `point_balances`, display metadata in `point_prof
 
 ## HTTPS deployment on a VPS (recommended)
 
+For the additive Supabase egress optimization, see [the conditional-read rollout](EGRESS_ROLLOUT.md).
+It works with the existing production plugins and website; the API and migration
+can be rolled out in either order.
+
 The running API calls Supabase's HTTPS Data API through the existing transactional,
 scoped functions in `strafe_api`. It requires no PostgreSQL password, certificate file,
 or direct database port. Node verifies HTTPS certificates through its normal trust store.
